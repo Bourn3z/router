@@ -375,10 +375,9 @@ impl Router {
                 );
             supervisor.set_api_key(ctx.router_config.api_key.clone());
             let static_sources = match &ctx.router_config.policy {
-                crate::config::PolicyConfig::KvAware {
-                    static_kv_event_sources,
-                    ..
-                } => static_kv_event_sources.as_ref().clone(),
+                crate::config::PolicyConfig::KvAware(config) => {
+                    config.static_kv_event_sources.as_ref().clone()
+                }
                 _ => HashMap::new(),
             };
             let supervisor = supervisor.with_static_sources(static_sources);
@@ -3572,13 +3571,18 @@ mod tests {
         let worker = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let config = RouterConfig {
-            policy: PolicyConfig::KvAware {
+            policy: PolicyConfig::KvAware(Box::new(crate::config::KvAwareConfig {
                 router_temperature: 0.0,
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-            },
+                kv_index_backend: "local".to_string(),
+                conductor_url: None,
+                conductor_query_timeout_ms: 10,
+                conductor_hash_profile: None,
+                ..Default::default()
+            })),
             worker_startup_timeout_secs: 5,
             ..Default::default()
         };
@@ -3660,7 +3664,7 @@ mod tests {
         let app = axum::Router::new().route("/health", get(|| async { "ok" }));
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let config = RouterConfig {
-            policy: PolicyConfig::KvAware {
+            policy: PolicyConfig::KvAware(Box::new(crate::config::KvAwareConfig {
                 router_temperature: 0.0,
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
@@ -3672,7 +3676,12 @@ mod tests {
                     }}))
                     .unwrap(),
                 ),
-            },
+                kv_index_backend: "local".to_string(),
+                conductor_url: None,
+                conductor_query_timeout_ms: 10,
+                conductor_hash_profile: None,
+                ..crate::config::KvAwareConfig::default()
+            })),
             worker_startup_timeout_secs: 5,
             ..Default::default()
         };
@@ -3714,6 +3723,7 @@ mod tests {
             group_idx: 0,
             local_hashes: crate::kv_index::local_block_hash_strings(&[1; 8], 8, None),
             tiers_of_interest: vec![StorageTier::Device],
+            request: None,
         };
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -3788,13 +3798,18 @@ mod tests {
             let http_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let config = RouterConfig {
                 api_key: Some("backend-key".to_owned()),
-                policy: PolicyConfig::KvAware {
+                policy: PolicyConfig::KvAware(Box::new(crate::config::KvAwareConfig {
                     router_temperature: 0.0,
                     kv_penalty_host: 0.8,
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
-                },
+                    kv_index_backend: "local".to_string(),
+                    conductor_url: None,
+                    conductor_query_timeout_ms: 10,
+                    conductor_hash_profile: None,
+                    ..Default::default()
+                })),
                 worker_startup_timeout_secs: 5,
                 worker_startup_check_interval_secs: 1,
                 ..Default::default()
@@ -3860,6 +3875,7 @@ mod tests {
                     None,
                 ),
                 tiers_of_interest: vec![StorageTier::HostPinned],
+                request: None,
             };
             publisher
                 .send_multipart(
@@ -4567,13 +4583,18 @@ mod tests {
             router.policy_registry = Arc::new(PolicyRegistry::new(if model_kv {
                 crate::config::PolicyConfig::RoundRobin
             } else {
-                crate::config::PolicyConfig::KvAware {
+                crate::config::PolicyConfig::KvAware(Box::new(crate::config::KvAwareConfig {
                     router_temperature: 0.0,
                     kv_penalty_host: 0.8,
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
-                }
+                    kv_index_backend: "local".to_string(),
+                    conductor_url: None,
+                    conductor_query_timeout_ms: 10,
+                    conductor_hash_profile: None,
+                    ..Default::default()
+                }))
             }));
             router.policy_registry.on_worker_added(
                 "qwen3",
@@ -5421,14 +5442,20 @@ mod tests {
     fn create_test_kv_router() -> Router {
         let mut router = create_test_regular_router();
         router.worker_registry = Arc::new(WorkerRegistry::new());
-        router.policy_registry =
-            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+        router.policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::PolicyConfig::KvAware(Box::new(crate::config::KvAwareConfig {
                 router_temperature: 0.0,
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-            }));
+                kv_index_backend: "local".to_string(),
+                conductor_url: None,
+                conductor_query_timeout_ms: 10,
+                conductor_hash_profile: None,
+                ..Default::default()
+            })),
+        ));
         router
     }
 
@@ -5874,14 +5901,22 @@ mod tests {
         let mut router = create_test_regular_router();
         router.worker_registry = Arc::new(WorkerRegistry::new());
         router.worker_registry.register(worker.clone());
-        router.policy_registry =
-            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+        router.policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::PolicyConfig::KvAware(Box::new(crate::config::KvAwareConfig {
                 router_temperature: 0.0,
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-            }));
+                kv_index_backend: "local".to_string(),
+                conductor_url: None,
+                conductor_register: true,
+                conductor_connect_timeout_ms: 100,
+                conductor_query_timeout_ms: 10,
+                conductor_register_timeout_ms: 1000,
+                conductor_hash_profile: None,
+            })),
+        ));
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "messages": [{"role": "user", "content": "hello"}]
         }))
@@ -5921,14 +5956,22 @@ mod tests {
         let mut router = create_test_regular_router();
         router.worker_registry = Arc::new(WorkerRegistry::new());
         router.worker_registry.register(worker.clone());
-        router.policy_registry =
-            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+        router.policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::PolicyConfig::KvAware(Box::new(crate::config::KvAwareConfig {
                 router_temperature: 0.0,
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-            }));
+                kv_index_backend: "local".to_string(),
+                conductor_url: None,
+                conductor_register: true,
+                conductor_connect_timeout_ms: 100,
+                conductor_query_timeout_ms: 10,
+                conductor_register_timeout_ms: 1000,
+                conductor_hash_profile: None,
+            })),
+        ));
 
         let request = serde_json::json!({"messages": []});
         let dispatch = tokio::spawn(async move {
@@ -6698,14 +6741,22 @@ mod tests {
             let mut router = create_test_regular_router();
             router.worker_registry = Arc::new(WorkerRegistry::new());
             router.worker_registry.register(worker.clone());
-            router.policy_registry =
-                Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+            router.policy_registry = Arc::new(PolicyRegistry::new(
+                crate::config::PolicyConfig::KvAware(Box::new(crate::config::KvAwareConfig {
                     router_temperature: 0.0,
                     kv_penalty_host: 0.8,
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
-                }));
+                    kv_index_backend: "local".to_string(),
+                    conductor_url: None,
+                    conductor_register: true,
+                    conductor_connect_timeout_ms: 100,
+                    conductor_query_timeout_ms: 10,
+                    conductor_register_timeout_ms: 1000,
+                    conductor_hash_profile: None,
+                })),
+            ));
             let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
                 "messages": [{"role": "user", "content": "hello"}], "stream": streaming,
             }))
@@ -6763,14 +6814,22 @@ mod tests {
         let mut router = create_test_regular_router();
         router.worker_registry = Arc::new(WorkerRegistry::new());
         router.worker_registry.register(worker.clone());
-        router.policy_registry =
-            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+        router.policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::PolicyConfig::KvAware(Box::new(crate::config::KvAwareConfig {
                 router_temperature: 0.0,
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-            }));
+                kv_index_backend: "local".to_string(),
+                conductor_url: None,
+                conductor_register: true,
+                conductor_connect_timeout_ms: 100,
+                conductor_query_timeout_ms: 10,
+                conductor_register_timeout_ms: 1000,
+                conductor_hash_profile: None,
+            })),
+        ));
         router.retry_config.max_retries = 0;
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "messages": [{"role": "user", "content": "hello"}],
