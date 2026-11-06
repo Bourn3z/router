@@ -18,7 +18,7 @@ use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::kv_aware_policy;
 use crate::policies::KvRequestTokens;
 use crate::policies::{
-    kv_aware_ops, AffinityKey, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy,
+    kv_aware_ops, AffinityKey, KvPrefetch, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy,
     PolicyRegistry,
 };
 use crate::program_scheduling::{
@@ -1402,6 +1402,7 @@ impl Router {
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
+        prefetch: Option<&KvPrefetch>,
     ) -> Option<SelectedWorker> {
         if available.is_empty() {
             return None;
@@ -1415,7 +1416,7 @@ impl Router {
         if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
             // The policy sees the full list: a retry exclusion must not
             // rewrite a still-valid binding.
-            let receipt = kv_aware.select_worker_with_qualified_inputs(
+            let receipt = kv_aware.select_worker_with_prefetch(
                 available,
                 token_ids,
                 lora_name,
@@ -1423,6 +1424,7 @@ impl Router {
                 affinity_key,
                 excluded_workers,
                 eligibility,
+                prefetch,
             )?;
             return Some(SelectedWorker {
                 worker: available.get(receipt.worker_index)?.clone(),
@@ -1591,6 +1593,24 @@ impl Router {
                     })
             });
 
+        let kv_prefetch = match (
+            prepared,
+            kv_aware_ops(self.policy_for_model(model_id).as_ref()),
+        ) {
+            (Some(prepared), Some(kv_aware)) => {
+                kv_aware
+                    .prefetch_matches(
+                        model_id,
+                        KvRequestTokens::Shared(Some(prepared.tokenized.token_ids.as_ref())),
+                        lora_name,
+                        cache_salt,
+                    )
+                    .await
+            }
+            _ => KvPrefetch::default(),
+        };
+        let kv_prefetch = prepared.as_ref().map(|_| &kv_prefetch);
+
         let http_inputs = &http_inputs;
         let failed_workers = &failed_workers;
         let affinity_key = &affinity_key;
@@ -1698,7 +1718,7 @@ impl Router {
                             )
                         });
                     let kv_receipt = kv_aware_ops(policy.as_ref()).and_then(|kv_aware| {
-                        kv_aware.select_worker_with_qualified_inputs(
+                        kv_aware.select_worker_with_prefetch(
                             std::slice::from_ref(&worker),
                             request_tokens,
                             lora_name,
@@ -1706,6 +1726,7 @@ impl Router {
                             affinity_key.as_ref(),
                             &[],
                             eligibility.as_deref(),
+                            kv_prefetch,
                         )
                     });
                     Some(SelectedWorker { worker, kv_receipt })
@@ -1725,6 +1746,7 @@ impl Router {
                         cache_salt,
                         affinity_key.as_ref(),
                         &excluded_workers,
+                        kv_prefetch,
                     )
                 };
                 let SelectedWorker { worker, kv_receipt } = match selected_worker {
@@ -7080,6 +7102,7 @@ mod tests {
                     None,
                     None,
                     &[],
+                    None,
                 )
                 .expect("Should select a worker");
             selected_urls.push(worker.worker.url().to_string());
@@ -7121,6 +7144,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             )
             .expect("Should select the remaining healthy worker");
 
@@ -7153,6 +7177,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
         assert!(
             result.is_none(),
@@ -7176,6 +7201,7 @@ mod tests {
                     None,
                     None,
                     excluded,
+                    None,
                 )
                 .expect("Should select a worker")
                 .worker
@@ -7208,6 +7234,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             ) {
                 worker_urls_seen.insert(worker.worker.url().to_string());
             }
