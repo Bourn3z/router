@@ -791,7 +791,7 @@ fn static_pd_discovery(
     worker_url: &str,
     config: &crate::config::types::PdKvEventSources,
 ) -> WorkerDiscovery {
-    static_worker_discovery(
+    let mut discovery = static_worker_discovery(
         worker_url,
         &StaticKvEventSources {
             model: config
@@ -805,7 +805,24 @@ fn static_pd_discovery(
             replay_endpoints: config.replay_endpoints.clone(),
             topic: String::new(),
         },
-    )
+    );
+    // 外部 LB：该 URL 只对应引擎的一个 DP rank。把静态源的 rank 从"endpoint 下标"
+    // 换成引擎真实 rank，Conductor 的事件断言与 (instance, rank) 放置查询才对得上。
+    if let Some(base_rank) = config.dp_rank {
+        if let Ok(sources) = discovery.sources {
+            let remapped: Result<std::collections::HashMap<String, KvEventSourceEntry>, String> =
+                sources
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, (_, entry))| {
+                        let rank = base_rank.saturating_add(offset as u32);
+                        Ok((rank.to_string(), entry))
+                    })
+                    .collect();
+            discovery.sources = remapped.map_err(|e| e);
+        }
+    }
+    discovery
 }
 
 fn grpc_kv_event_source_entries(

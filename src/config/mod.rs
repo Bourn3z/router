@@ -83,20 +83,44 @@ pub fn parse_static_kv_event_sources(
 }
 
 /// Parse repeatable static PD KV-source specifications for both launchers.
+///
+/// `block_size` / `model` come from the caller's `--kv-event-block-size` and
+/// `--kv-event-model`. They used to be hard-coded to `16` / `None`, which left
+/// PD static sources without a cache identity: `model: None` falls back to the
+/// worker URL, so every worker landed in its own Conductor context and the
+/// shared pool copy was never visible. Engines whose hash unit is not 16
+/// (vllm-ascend uses 8576) were mis-keyed as well.
 pub fn parse_pd_kv_events(
     specs: &[String],
+    block_size: u32,
+    model: Option<&str>,
 ) -> ConfigResult<std::collections::HashMap<String, PdKvEventSources>> {
+    let model = model.map(str::trim).filter(|model| !model.is_empty());
     let mut sources = std::collections::HashMap::new();
     for spec in specs {
         let (url, endpoints) = parse_event_source_spec(spec, "pd-kv-events")?;
+        // 可选语法：URL[@RANK]=ENDPOINT[,ENDPOINT...]，RANK 是该 worker 的引擎 DP rank
+        // （外部 LB 部署每个 URL 就是一个 rank）。不带 @RANK 时沿用 endpoint 下标。
+        let (url, dp_rank) = match url.split_once('@') {
+            Some((url, rank)) => {
+                let rank = rank.trim().parse::<u32>().map_err(|_| {
+                    ConfigError::ValidationFailed {
+                        reason: format!("invalid DP rank '{rank}' in --pd-kv-events '{spec}'"),
+                    }
+                })?;
+                (url.trim(), Some(rank))
+            }
+            None => (url, None),
+        };
         if sources
             .insert(
                 url.to_owned(),
                 PdKvEventSources {
                     endpoints,
                     replay_endpoints: None,
-                    block_size: 16,
-                    model: None,
+                    block_size,
+                    model: model.map(str::to_owned),
+                    dp_rank,
                 },
             )
             .is_some()
@@ -217,7 +241,7 @@ mod static_kv_event_source_tests {
             "http://worker:8000=tcp://10.0.0.1:5557".to_owned(),
             "http://worker:8000=tcp://10.0.0.1:9999".to_owned(),
         ];
-        let error = parse_pd_kv_events(&specs).unwrap_err().to_string();
+        let error = parse_pd_kv_events(&specs, 16, None).unwrap_err().to_string();
         assert!(
             error.contains("duplicate --pd-kv-events worker URL"),
             "{error}"

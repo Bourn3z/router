@@ -515,10 +515,30 @@ impl ConductorMatchProvider {
             Ok(bytes) => bytes,
             Err(error) => {
                 ConductorMetrics::record_query_error(error.reason());
+                tracing::warn!(
+                    conductor = %self.base_url,
+                    model = request.model_id.as_deref().unwrap_or(""),
+                    block_size = request.block_size,
+                    tokens = request.token_ids.len(),
+                    elapsed_us = started.elapsed().as_micros() as u64,
+                    reason = error.reason(),
+                    "conductor /query failed; falling back to load-only"
+                );
                 return Err(error);
             }
         };
-        self.translate(&bytes, request, &query.tiers_of_interest)
+        let rows = self.translate(&bytes, request, &query.tiers_of_interest)?;
+        tracing::info!(
+            conductor = %self.base_url,
+            model = request.model_id.as_deref().unwrap_or(""),
+            block_size = request.block_size,
+            tokens = request.token_ids.len(),
+            rows = rows.len(),
+            hits = %summarize_rows(&rows),
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "conductor /query"
+        );
+        Ok(rows)
     }
 
     /// Non-blocking `/query`. Same msgpack protocol and translation as
@@ -546,10 +566,30 @@ impl ConductorMatchProvider {
             Ok(bytes) => bytes,
             Err(error) => {
                 ConductorMetrics::record_query_error(error.reason());
+                tracing::warn!(
+                    conductor = %self.base_url,
+                    model = request.model_id.as_deref().unwrap_or(""),
+                    block_size = request.block_size,
+                    tokens = request.token_ids.len(),
+                    elapsed_us = started.elapsed().as_micros() as u64,
+                    reason = error.reason(),
+                    "conductor /query failed; falling back to load-only"
+                );
                 return Err(error);
             }
         };
-        self.translate(&bytes, request, &query.tiers_of_interest)
+        let rows = self.translate(&bytes, request, &query.tiers_of_interest)?;
+        tracing::info!(
+            conductor = %self.base_url,
+            model = request.model_id.as_deref().unwrap_or(""),
+            block_size = request.block_size,
+            tokens = request.token_ids.len(),
+            rows = rows.len(),
+            hits = %summarize_rows(&rows),
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "conductor /query"
+        );
+        Ok(rows)
     }
 
     fn translate(
@@ -735,6 +775,73 @@ fn encode_unregister(instance_id: &str, dp_rank: u32) -> Vec<u8> {
     let mut out = Vec::new();
     rmpv::encode::write_value(&mut out, &Value::Map(map)).expect("encode unregister");
     out
+}
+
+/// Compact one-line summary of translated `/query` rows for the request-path log:
+/// `inst#rank[device=3,cpu_share=3]; ...`. Tier counts are blocks, not tokens.
+fn summarize_rows(rows: &[TierMatch]) -> String {
+    if rows.is_empty() {
+        return "<no-match>".to_string();
+    }
+    // Stable order: instance id, then rank.
+    let mut keys: Vec<(&str, u32)> = rows
+        .iter()
+        .map(|row| (row.target.instance_id.as_ref(), row.target.dp_rank))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let tier_name = |tier: StorageTier| match tier {
+        StorageTier::Device => "device",
+        StorageTier::HostPinned => "cpu_local",
+        StorageTier::External => "cpu_share",
+        StorageTier::Disk => "disk",
+    };
+    let mut out = String::new();
+    for (instance, rank) in keys {
+        let mut counts: Vec<(&str, u32)> = Vec::new();
+        for row in rows {
+            if row.target.instance_id.as_ref() != instance || row.target.dp_rank != rank {
+                continue;
+            }
+            let blocks: u32 = row
+                .segments
+                .iter()
+                .map(|(start, end)| end.saturating_sub(*start))
+                .sum();
+            if blocks == 0 {
+                continue;
+            }
+            let name = tier_name(row.tier);
+            match counts.iter_mut().find(|(tier, _)| *tier == name) {
+                Some(entry) => entry.1 += blocks,
+                None => counts.push((name, blocks)),
+            }
+        }
+        if counts.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("; ");
+        }
+        out.push_str(instance);
+        out.push('#');
+        out.push_str(&rank.to_string());
+        out.push('[');
+        for (index, (tier, blocks)) in counts.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(tier);
+            out.push('=');
+            out.push_str(&blocks.to_string());
+        }
+        out.push(']');
+    }
+    if out.is_empty() {
+        "<no-match>".to_string()
+    } else {
+        out
+    }
 }
 
 /// Translate Conductor's `/query` response into flat `(target, tier)` rows.

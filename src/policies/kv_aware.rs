@@ -1643,6 +1643,65 @@ impl KvAwarePolicy {
 
     /// Pure selection without reservation, used by the generic
     /// `LoadBalancingPolicy` entry points that account load themselves.
+    /// 一站式打印"候选（含命中与负载）→ 最终选点"，request-path 上每个请求一条。
+    /// 纯选点（PD 模式走这里）与预取路径共用，避免两处字段漂移。
+    fn log_selection(
+        &self,
+        plan: &SelectionPlan,
+        candidates: &[CandidateView<'_>],
+        costs: &[f64],
+        components: &[CostComponents],
+        position: usize,
+    ) {
+        for (index, candidate) in candidates.iter().enumerate() {
+            let device_blocks: u32 = candidate
+                .matches
+                .iter()
+                .filter(|hit| hit.tier == StorageTier::Device)
+                .flat_map(|hit| hit.segments.iter())
+                .map(|(start, end)| end - start)
+                .sum();
+            let total_matched: u32 = candidate
+                .matches
+                .iter()
+                .flat_map(|hit| hit.segments.iter())
+                .map(|(start, end)| end - start)
+                .sum();
+            tracing::info!(
+                worker = %candidate.target.instance_id,
+                rank = candidate.target.dp_rank,
+                token_ids_present = plan.has_tokens,
+                input_tokens = candidate.input_tokens,
+                tier_matches = candidate.matches.len(),
+                device_blocks,
+                total_matched_blocks = total_matched,
+                load_active_requests = candidate.load.active_requests,
+                load_active_prefill_tokens = candidate.load.active_prefill_tokens,
+                cost = costs[index],
+                ptoken = components[index].ptoken,
+                batchsize = components[index].batchsize,
+                selected = index == position,
+                "kv_aware_select: candidate"
+            );
+        }
+        let target = &plan.bindings[position].target;
+        let new_prefill_tokens = request_prefill_tokens(&candidates[position], &self.params);
+        tracing::info!(
+            worker = %target.instance_id,
+            rank = target.dp_rank,
+            token_ids_present = plan.has_tokens,
+            input_tokens = plan.input_tokens[position],
+            pick_kind = if plan.has_tokens { "kv-aware" } else { "load-fallback" },
+            cost = costs[position],
+            new_prefill_tokens,
+            credited_prefix_tokens =
+                (plan.input_tokens[position] as u64).saturating_sub(new_prefill_tokens),
+            load_active_requests = candidates[position].load.active_requests,
+            tier_matches = candidates[position].matches.len(),
+            "kv_aware_select: picked"
+        );
+    }
+
     fn select_worker_pure(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1663,6 +1722,7 @@ impl KvAwarePolicy {
         let candidates = self.candidate_views(workers, &plan);
         let (costs, components) = self.score_candidates(&plan, &candidates)?;
         let position = self.pick_position(plan.has_tokens, &costs, &components, None)?;
+        self.log_selection(&plan, &candidates, &costs, &components, position);
         let (worker_index, _, decision) =
             self.decision_for_position(&plan, &candidates, &costs, &components, position);
         Some((worker_index, decision))
@@ -1813,6 +1873,9 @@ impl KvAwarePolicy {
                     tier_matches = candidate.matches.len(),
                     device_blocks,
                     total_matched_blocks = total_matched,
+                    // 负载：活跃请求数（slot manager 与 worker.load 取大）与已占用 prefill token
+                    load_active_requests = candidate.load.active_requests,
+                    load_active_prefill_tokens = candidate.load.active_prefill_tokens,
                     cost = costs[index],
                     ptoken = components[index].ptoken,
                     batchsize = components[index].batchsize,
@@ -1872,6 +1935,12 @@ impl KvAwarePolicy {
                 },
                 cost = costs[position],
                 new_prefill_tokens,
+                // 命中前缀 = 输入 - 仍需重算的 prefill token
+                credited_prefix_tokens =
+                    (plan.input_tokens[position] as u64).saturating_sub(new_prefill_tokens),
+                load_active_requests = candidates[position].load.active_requests,
+                load_active_prefill_tokens = candidates[position].load.active_prefill_tokens,
+                tier_matches = candidates[position].matches.len(),
                 "kv_aware_select: picked"
             );
             let outcome = if used_binding {
@@ -2637,13 +2706,17 @@ impl KvAwareOps for KvAwarePolicy {
         info: Option<&WorkerKvInfo>,
         matches: Option<Arc<dyn TieredMatchProvider>>,
     ) {
+        // 优先用发现到的 KV 源 rank：外部 LB 下每个 worker 就是引擎的一个 DP rank，
+        // Conductor 的放置结果按 (instance_id, dp_rank) 归属，rank 对不上会全部 miss。
+        let source_rank = info
+            .and_then(|info| info.sources.first().map(|source| source.dp_rank));
         let target = RoutableTarget {
             instance_id: Arc::from(
                 info.map(|info| info.instance_id.as_str())
                     .filter(|id| !id.is_empty())
                     .unwrap_or_else(|| worker.base_url()),
             ),
-            dp_rank: worker.dp_rank().unwrap_or(0) as u32,
+            dp_rank: source_rank.unwrap_or_else(|| worker.dp_rank().unwrap_or(0) as u32),
         };
         match (info.and_then(|info| info.cache_key.clone()), matches) {
             (Some(cache_key), Some(matches)) => {

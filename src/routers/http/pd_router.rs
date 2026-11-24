@@ -271,9 +271,28 @@ fn select_stage(
                 })
                 .collect();
             let occupancy: Vec<_> = projected.iter().map(|worker| worker.load()).collect();
-            debug!(version = 1, stage = "prefill", endpoints = ?selected_indices.iter()
-                .map(|&index| &endpoints[index]).collect::<Vec<_>>(), ?costs, ?occupancy,
-                remaining_work = ?work, "P/D token-cost candidates");
+            // 候选明细（每个 P）：Conductor 命中的前缀带来的"仍需重算 token"、
+            // 当前负载占用、以及合成的成本。request-path 上每个请求一条。
+            let candidates: Vec<String> = selected_indices
+                .iter()
+                .enumerate()
+                .map(|(slot, &index)| {
+                    format!(
+                        "{}#{}[cost={:.0} new_prefill={} verified={} occ={}]",
+                        endpoints[index].http_url,
+                        endpoints[index].dp_rank.unwrap_or(0),
+                        costs[slot],
+                        work[slot].new_prefill_tokens,
+                        work[slot].placement_verified,
+                        occupancy.get(slot).copied().unwrap_or(0),
+                    )
+                })
+                .collect();
+            info!(
+                stage = "prefill",
+                candidates = %candidates.join(" | "),
+                "pd_select: candidates"
+            );
             // P follows actual token work across the full eligible pool;
             // decode session affinity must never filter or pin prefill.
             if let Some(picked) = kv.pick_prefill(&costs, &occupancy) {
@@ -287,6 +306,21 @@ fn select_stage(
                 };
                 crate::metrics::RouterMetrics::record_prefix_routing_decision(
                     "kv_aware", "prefill", outcome,
+                );
+                // `credited_prefix_tokens` 这个名字容易误读：它实际是请求的输入
+                // token 总数，真正被索引命中、无需重算的部分是 input - new_prefill。
+                // 把后者显式打出来，排障时不用再做减法。
+                let input_tokens = tokens.iter().map(|ids| ids.len() as u64).sum::<u64>();
+                info!(
+                    stage = "prefill",
+                    picked = %endpoints[selected_indices[picked]].http_url,
+                    cost = costs[picked],
+                    new_prefill_tokens = new_tokens,
+                    credited_prefix_tokens = input_tokens,
+                    prefix_hit_tokens = input_tokens.saturating_sub(new_tokens),
+                    placement_verified = estimate.placement_verified,
+                    outcome,
+                    "pd_select: picked"
                 );
                 return Some(StageDecision {
                     worker_index: selected_indices[picked],

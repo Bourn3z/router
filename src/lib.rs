@@ -264,7 +264,11 @@ impl Router {
         let config = config::RouterConfig {
             epd: None,
             mode,
-            pd_kv_event_sources: config::parse_pd_kv_events(&self.pd_kv_events)?,
+            pd_kv_event_sources: config::parse_pd_kv_events(
+                &self.pd_kv_events,
+                self.kv_event_block_size,
+                self.kv_event_model.as_deref(),
+            )?,
             policy,
             host: self.host.clone(),
             port: self.port,

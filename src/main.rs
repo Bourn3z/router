@@ -559,8 +559,12 @@ impl CliArgs {
         }
     }
 
-    fn parse_pd_kv_events(specs: &[String]) -> ConfigResult<HashMap<String, PdKvEventSources>> {
-        vllm_router_rs::config::parse_pd_kv_events(specs)
+    fn parse_pd_kv_events(
+        specs: &[String],
+        block_size: u32,
+        model: Option<&str>,
+    ) -> ConfigResult<HashMap<String, PdKvEventSources>> {
+        vllm_router_rs::config::parse_pd_kv_events(specs, block_size, model)
     }
 
     /// Convert CLI arguments to RouterConfig
@@ -721,7 +725,13 @@ impl CliArgs {
             self.program_scheduling_config_json.as_deref(),
         )?;
 
-        let pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
+        // PD 静态源也要带上引擎的 model/block_size，否则 Conductor 的 ContextKey
+        // 会退化成 worker URL、block=16
+        let pd_kv_event_sources = Self::parse_pd_kv_events(
+            &self.pd_kv_events,
+            self.kv_event_block_size,
+            self.kv_event_model.as_deref(),
+        )?;
 
         // Build RouterConfig
         Ok(RouterConfig {
@@ -1091,13 +1101,18 @@ mod tests {
             "http://prefill2:8000=tcp://prefill2:5557, tcp://prefill2:5559".to_string(),
         ]
         .to_vec();
-        let sources = CliArgs::parse_pd_kv_events(&specs).unwrap();
+        let sources = CliArgs::parse_pd_kv_events(&specs, 8576, Some("glm53flash")).unwrap();
         assert_eq!(sources.len(), 2);
         assert_eq!(
             sources["http://prefill:8000"].endpoints,
             vec!["tcp://prefill:5557".to_string()]
         );
-        assert_eq!(sources["http://prefill:8000"].block_size, 16);
+        // PD 静态源沿用 --kv-event-block-size / --kv-event-model，而不是写死的 16/None
+        assert_eq!(sources["http://prefill:8000"].block_size, 8576);
+        assert_eq!(
+            sources["http://prefill:8000"].model.as_deref(),
+            Some("glm53flash")
+        );
         // The space after ',' is intentional: exercises endpoint trimming.
         assert_eq!(
             sources["http://prefill2:8000"].endpoints,
@@ -1109,7 +1124,7 @@ mod tests {
 
         for bad in ["no-endpoint", "http://p:8000=", "=tcp://p:5557"] {
             assert!(
-                CliArgs::parse_pd_kv_events(&[bad.to_string()]).is_err(),
+                CliArgs::parse_pd_kv_events(&[bad.to_string()], 16, None).is_err(),
                 "should reject '{bad}'"
             );
         }

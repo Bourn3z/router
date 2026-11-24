@@ -1,5 +1,6 @@
 //! P/D prefill KV discovery, refresh, and request-input preparation.
 
+use tracing::info;
 use super::pd_types::PdPrefillInput;
 use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs};
 use crate::core::worker::worker_get;
@@ -259,6 +260,20 @@ impl PdKvState {
             .collect()
             .await;
         for (base, discovery) in probes {
+            // 绑定成败决定该 worker 能否拿到前缀 credit；绑定成功打一行，失败告警
+            match discovery.as_ref() {
+                Some(snapshot) => info!(
+                    worker = %base,
+                    ranks = snapshot.worker.sources.as_ref().map(|sources| sources.len()).unwrap_or(0),
+                    block_size = snapshot.worker.server_info.as_ref().ok().and_then(|info| info.kv_block_size),
+                    served_models = snapshot.base_models.len(),
+                    "pd_kv_bind: worker bound"
+                ),
+                None => tracing::warn!(
+                    worker = %base,
+                    "pd_kv_bind: probe failed; this worker routes without prefix credit"
+                ),
+            }
             let existing = {
                 let bindings = self.bindings.lock().await;
                 bindings.get(&base).cloned()
@@ -348,7 +363,16 @@ impl PdKvState {
             // probes) shares this table, and KvAwarePolicy::prepare_selection
             // drops every unregistered worker once any target is registered.
             let matches = info.and_then(|info| {
-                let rank = worker.dp_rank().unwrap_or(0) as u32;
+                // 用**发现到的** KV 源 rank，而不是 worker.dp_rank()：外部 LB 部署里
+                // 每个 P URL 就是一个引擎 DP rank（静态源里显式声明），worker 本身
+                // 没有 dp_rank（None→0），直接拿它比对 info.ranks 会让除 rank0 以外
+                // 的所有 worker 丢掉 cache identity → 前缀 credit 全为 0。
+                let rank = info
+                    .sources
+                    .first()
+                    .map(|source| source.dp_rank)
+                    .or_else(|| worker.dp_rank().map(|rank| rank as u32))
+                    .unwrap_or(0);
                 info.ranks
                     .contains(&rank)
                     .then(|| self.supervisor.match_provider_for_worker(worker.base_url()))

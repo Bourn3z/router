@@ -915,6 +915,15 @@ pub struct PdKvEventSources {
     /// served-model check then relies on `/v1/models`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Data-parallel rank this worker's KV event stream is published under.
+    ///
+    /// External-LB deployments run one engine process per URL, each with its
+    /// own `--data-parallel-rank`, so the events carry that engine rank. Without
+    /// it the rank defaults to the endpoint index (0 for a single endpoint),
+    /// which makes Conductor/per-worker placement lookups miss every worker
+    /// whose engine rank is not 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dp_rank: Option<u32>,
 }
 
 fn default_pd_kv_block_size() -> u32 {
